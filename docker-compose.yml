@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  downloader-bot:
+    build: .
+    image: tg-downloader-bot:latest
+    container_name: tg-downloader-bot-service
+    restart: always
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./bot_database.db:/app/bot_database.db
+      - ./bot.log:/app/bot.log
+      - ./downloads:/app/downloads
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - ADMIN_ID=${ADMIN_ID}
+      - PORT=8080
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/stats"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

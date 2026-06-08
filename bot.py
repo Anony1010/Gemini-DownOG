@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import telebot
 import yt_dlp
 import threading
@@ -12,19 +13,16 @@ from database import (
     set_setting, delete_setting, db_add_clone, db_get_all_clones,
     db_delete_clone
 )
+from shared import (
+    logger, download_queue, active_clones, active_user_downloads,
+    active_downloads_lock, DOWNLOAD_DIR
+)
 
 # Load environment variables
 load_dotenv()
 
-# Active clone bot instances {token: bot_instance}
-active_clones = {}
-
 # Active admin states {user_id: {'state': state_name}}
 user_states = {}
-
-DOWNLOAD_DIR = "downloads"
-if not os.path.exists(DOWNLOAD_DIR):
-    os.makedirs(DOWNLOAD_DIR)
 
 # Regular expressions for matching links
 YOUTUBE_REGEX = r"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/|youtube\.com/embed/|youtube\.com/v/|youtube\.com/live/|m\.youtube\.com/watch\?v=)([\w-]+)"
@@ -36,9 +34,9 @@ def clean_file(filepath):
     try:
         if filepath and os.path.exists(filepath):
             os.remove(filepath)
-            print(f"Cleaned up file: {filepath}")
+            logger.info(f"Cleaned up file: {filepath}")
     except Exception as e:
-        print(f"Error cleaning up file {filepath}: {e}")
+        logger.error(f"Error cleaning up file {filepath}: {e}")
 
 def is_admin(user_id):
     """Check if user is admin. Auto-assigns first user if no admin exists."""
@@ -273,7 +271,7 @@ def handle_admin_state_input(bot_inst, message, state):
                 bot_inst.copy_message(chat_id=dest_id, from_chat_id=chat_id, message_id=message.message_id)
                 sent_count += 1
             except Exception as e:
-                print(f"Failed to send broadcast to {dest_id}: {e}")
+                logger.error(f"Failed to send broadcast to {dest_id}: {e}")
                 fail_count += 1
                 
         bot_inst.send_message(chat_id, f"📢 **Toplu mesaj tamamlandı.**\n\n✅ Göndərildi: {sent_count}\n❌ Uğursuz: {fail_count}")
@@ -328,79 +326,172 @@ def handle_admin_state_input(bot_inst, message, state):
         send_admin_menu(bot_inst, chat_id)
 
 
-# Core Downloader Tasks
-def download_youtube_mp3(bot_inst, message, wait_msg):
+# Progress Bar Hook Creator
+def make_progress_hook(bot_inst, chat_id, wait_msg_id):
+    last_update = [0.0]
+    
+    def hook(d):
+        if d['status'] == 'downloading':
+            now = time.time()
+            # Update only every 3 seconds to stay well below Telegram rate limits
+            if now - last_update[0] >= 3.0:
+                last_update[0] = now
+                total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+                downloaded = d.get('downloaded_bytes', 0)
+                speed = d.get('speed') or 0
+                speed_str = f"{speed / (1024 * 1024):.2f} MB/s" if speed else "Hesablanır..."
+                
+                if total > 0:
+                    percent = (downloaded / total) * 100
+                    text = f"⚡ Media yüklənir...\n📊 Tərəqqi: {percent:.1f}%\n🚀 Sürət: {speed_str}"
+                else:
+                    downloaded_mb = downloaded / (1024 * 1024)
+                    text = f"⚡ Media yüklənir...\n📊 Yükləndi: {downloaded_mb:.2f} MB\n🚀 Sürət: {speed_str}"
+                
+                try:
+                    bot_inst.edit_message_text(text, chat_id, wait_msg_id)
+                except Exception:
+                    pass
+    return hook
+
+# Processing Engine Workers
+def process_youtube_mp3(bot_inst, message, wait_msg):
     url = message.text.strip()
     chat_id = message.chat.id
+    user_id = message.from_user.id
+    
+    unique_id = f"{chat_id}_{message.message_id}"
+    filepath = os.path.join(DOWNLOAD_DIR, f"{unique_id}.mp3")
     
     ydl_opts = {
-        'format': 'ba[ext=m4a]/ba',  # Prefer m4a for fast audio conversion
-        'outtmpl': os.path.join(DOWNLOAD_DIR, '%(id)s.%(ext)s'),
+        'format': 'ba[ext=m4a]/ba',
+        'outtmpl': os.path.join(DOWNLOAD_DIR, f"{unique_id}.%(ext)s"),
         'external_downloader': 'aria2c',
         'external_downloader_args': {
-            'aria2c': ['-j', '8', '-x', '8', '-s', '8', '-k', '1M']
+            'aria2c': ['-j', '8', '-x', '8', '-s', '8', '-k', '1M', '--summary-interval=0']
         },
+        'max_filesize': 50 * 1024 * 1024,
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '128',  # 128k is fast to convert and download
+            'preferredquality': '128',
         }],
+        'progress_hooks': [make_progress_hook(bot_inst, chat_id, wait_msg.message_id)],
         'quiet': True,
         'no_warnings': True,
+        'nocheckcertificate': True,
+        'ignoreerrors': False,
     }
     
-    filepath = None
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            title = info.get('title', 'Audio')
-            filepath = os.path.join(DOWNLOAD_DIR, f"{info['id']}.mp3")
+        try:
+            bot_inst.edit_message_text("⚡ YouTube audiosu yüklənir...", chat_id, wait_msg.message_id)
+        except Exception:
+            pass
             
-            if not os.path.exists(filepath):
+        title = "Audio"
+        # Try downloading with aria2c
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                filesize = info.get('filesize') or info.get('filesize_approx') or 0
+                if filesize > 50 * 1024 * 1024:
+                    bot_inst.edit_message_text("⚠️ Faylın ölçüsü 50 MB limitini aşdı. Telegram bot limiti səbəbindən bunu göndərə bilmirəm.", chat_id, wait_msg.message_id)
+                    return
+                title = info.get('title', 'Audio')
+                ydl.download([url])
+        except Exception as e:
+            logger.warning(f"Download with aria2c failed: {e}. Retrying with native downloader...")
+            # Fallback: remove external_downloader
+            ydl_opts_fallback = ydl_opts.copy()
+            ydl_opts_fallback.pop('external_downloader', None)
+            ydl_opts_fallback.pop('external_downloader_args', None)
+            with yt_dlp.YoutubeDL(ydl_opts_fallback) as ydl:
+                info = ydl.extract_info(url, download=False)
+                filesize = info.get('filesize') or info.get('filesize_approx') or 0
+                if filesize > 50 * 1024 * 1024:
+                    bot_inst.edit_message_text("⚠️ Faylın ölçüsü 50 MB limitini aşdı. Telegram bot limiti səbəbindən bunu göndərə bilmirəm.", chat_id, wait_msg.message_id)
+                    return
+                title = info.get('title', 'Audio')
+                ydl.download([url])
+            
+        if not os.path.exists(filepath):
+            # Fallback check
+            potential_file = os.path.join(DOWNLOAD_DIR, f"{unique_id}.mp3")
+            if os.path.exists(potential_file):
+                filepath = potential_file
+            else:
                 raise FileNotFoundError("Yüklənmiş MP3 faylı tapılmadı.")
             
-            file_size = os.path.getsize(filepath)
-            if file_size > 50 * 1024 * 1024:
-                bot_inst.reply_to(message, "⚠️ Faylın ölçüsü 50 MB limitini aşdı. Telegram bot limiti səbəbindən bunu göndərə bilmirəm.")
-                return
+        actual_size = os.path.getsize(filepath)
+        if actual_size > 50 * 1024 * 1024:
+            bot_inst.edit_message_text("⚠️ Faylın ölçüsü 50 MB limitini aşdı. Telegram bot limiti səbəbindən bunu göndərə bilmirəm.", chat_id, wait_msg.message_id)
+            return
             
-            branding = get_setting("caption_branding") or "⚓ BY ORUJOV ⚓"
-            caption = f"🎵 {title}\n\n{branding}"
+        branding = get_setting("caption_branding") or "⚓ BY ORUJOV ⚓"
+        caption = f"🎵 {title}\n\n{branding}"
+        
+        try:
+            bot_inst.edit_message_text("📤 Fayl Telegram-a yüklənir...", chat_id, wait_msg.message_id)
+        except Exception:
+            pass
             
-            with open(filepath, 'rb') as audio:
-                bot_inst.send_audio(
-                    chat_id, 
-                    audio, 
-                    title=title, 
-                    caption=caption
-                )
+        with open(filepath, 'rb') as audio:
+            bot_inst.send_audio(
+                chat_id, 
+                audio, 
+                title=title, 
+                caption=caption
+            )
             
-            # Delete wait message
-            try:
-                bot_inst.delete_message(chat_id, wait_msg.message_id)
-            except Exception as e:
-                print(f"Error deleting wait message: {e}")
+        try:
+            bot_inst.delete_message(chat_id, wait_msg.message_id)
+        except Exception:
+            pass
                 
+    except yt_dlp.utils.DownloadError as de:
+        err_msg = str(de)
+        if "File is larger than max-filesize" in err_msg or "too large" in err_msg:
+            bot_inst.edit_message_text("⚠️ Faylın ölçüsü 50 MB limitini aşdı.", chat_id, wait_msg.message_id)
+        else:
+            bot_inst.edit_message_text("❌ Yükləmə zamanı xəta baş verdi. Linkin düzgünlüyünə əmin olun.", chat_id, wait_msg.message_id)
     except Exception as e:
-        print(f"YouTube download error: {e}")
-        bot_inst.reply_to(message, "❌ YouTube linkini yükləyərkən xəta baş verdi. Linkin düzgünlüyünə əmin olun.")
+        logger.error(f"YouTube download error: {e}")
+        try:
+            bot_inst.edit_message_text("❌ YouTube linkini yükləyərkən xəta baş verdi.", chat_id, wait_msg.message_id)
+        except Exception:
+            pass
     finally:
         clean_file(filepath)
+        # Cleanup any remaining fragments
+        for f in os.listdir(DOWNLOAD_DIR):
+            if f.startswith(unique_id):
+                clean_file(os.path.join(DOWNLOAD_DIR, f))
+        
+        with active_downloads_lock:
+            if user_id in active_user_downloads:
+                active_user_downloads[user_id] = max(0, active_user_downloads[user_id] - 1)
 
-def download_instagram_tiktok_mp4(bot_inst, message, wait_msg, platform):
+def process_instagram_tiktok_mp4(bot_inst, message, wait_msg, platform):
     url = message.text.strip()
     chat_id = message.chat.id
+    user_id = message.from_user.id
+    
+    unique_id = f"{chat_id}_{message.message_id}"
     
     ydl_opts = {
-        # Download already merged MP4 to avoid CPU-intensive ffmpeg merging on device
         'format': 'best[ext=mp4]/best',
-        'outtmpl': os.path.join(DOWNLOAD_DIR, '%(id)s.%(ext)s'),
+        'outtmpl': os.path.join(DOWNLOAD_DIR, f"{unique_id}.%(ext)s"),
         'external_downloader': 'aria2c',
         'external_downloader_args': {
-            'aria2c': ['-j', '8', '-x', '8', '-s', '8', '-k', '1M']
+            'aria2c': ['-j', '8', '-x', '8', '-s', '8', '-k', '1M', '--summary-interval=0']
         },
+        'max_filesize': 50 * 1024 * 1024,
+        'progress_hooks': [make_progress_hook(bot_inst, chat_id, wait_msg.message_id)],
         'quiet': True,
         'no_warnings': True,
+        'nocheckcertificate': True,
+        'ignoreerrors': False,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
@@ -408,47 +499,121 @@ def download_instagram_tiktok_mp4(bot_inst, message, wait_msg, platform):
     
     filepath = None
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            title = info.get('title', f'{platform} Videosu')
+        try:
+            bot_inst.edit_message_text(f"⚡ {platform} videosu yüklənir...", chat_id, wait_msg.message_id)
+        except Exception:
+            pass
             
-            if 'requested_downloads' in info and len(info['requested_downloads']) > 0:
-                filepath = info['requested_downloads'][0]['filepath']
-            else:
-                ext = info.get('ext', 'mp4')
-                filepath = os.path.join(DOWNLOAD_DIR, f"{info['id']}.{ext}")
+        title = f"{platform} Videosu"
+        info_down = None
+        # Try downloading with aria2c
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                filesize = info.get('filesize') or info.get('filesize_approx') or 0
+                if filesize > 50 * 1024 * 1024:
+                    bot_inst.edit_message_text("⚠️ Faylın ölçüsü 50 MB limitini aşdı. Telegram bot limiti səbəbindən bunu göndərə bilmirəm.", chat_id, wait_msg.message_id)
+                    return
+                title = info.get('title', f'{platform} Videosu')
+                info_down = ydl.extract_info(url, download=True)
+        except Exception as e:
+            logger.warning(f"Download with aria2c failed: {e}. Retrying with native downloader...")
+            # Fallback: remove external_downloader
+            ydl_opts_fallback = ydl_opts.copy()
+            ydl_opts_fallback.pop('external_downloader', None)
+            ydl_opts_fallback.pop('external_downloader_args', None)
+            with yt_dlp.YoutubeDL(ydl_opts_fallback) as ydl:
+                info = ydl.extract_info(url, download=False)
+                filesize = info.get('filesize') or info.get('filesize_approx') or 0
+                if filesize > 50 * 1024 * 1024:
+                    bot_inst.edit_message_text("⚠️ Faylın ölçüsü 50 MB limitini aşdı. Telegram bot limiti səbəbindən bunu göndərə bilmirəm.", chat_id, wait_msg.message_id)
+                    return
+                title = info.get('title', f'{platform} Videosu')
+                info_down = ydl.extract_info(url, download=True)
             
-            if not os.path.exists(filepath):
+        if info_down and 'requested_downloads' in info_down and len(info_down['requested_downloads']) > 0:
+            filepath = info_down['requested_downloads'][0]['filepath']
+        else:
+            found = False
+            for ext in ['mp4', 'mkv', 'webm', '3gp']:
+                potential = os.path.join(DOWNLOAD_DIR, f"{unique_id}.{ext}")
+                if os.path.exists(potential):
+                    filepath = potential
+                    found = True
+                    break
+            if not found:
                 raise FileNotFoundError("Yüklənmiş MP4 faylı tapılmadı.")
             
-            file_size = os.path.getsize(filepath)
-            if file_size > 50 * 1024 * 1024:
-                bot_inst.reply_to(message, f"⚠️ Faylın ölçüsü 50 MB limitini aşdı. Telegram bot limiti səbəbindən bunu göndərə bilmirəm.")
-                return
+        actual_size = os.path.getsize(filepath)
+        if actual_size > 50 * 1024 * 1024:
+            bot_inst.edit_message_text("⚠️ Faylın ölçüsü 50 MB limitini aşdı. Telegram bot limiti səbəbindən bunu göndərə bilmirəm.", chat_id, wait_msg.message_id)
+            return
             
-            branding = get_setting("caption_branding") or "⚓ BY ORUJOV ⚓"
-            caption = f"🎬 {title}\n\n{branding}"
-            
-            with open(filepath, 'rb') as video:
-                bot_inst.send_video(
-                    chat_id, 
-                    video, 
-                    caption=caption
-                )
-            
-            # Delete wait message
-            try:
-                bot_inst.delete_message(chat_id, wait_msg.message_id)
-            except Exception as e:
-                print(f"Error deleting wait message: {e}")
+        branding = get_setting("caption_branding") or "⚓ BY ORUJOV ⚓"
+        caption = f"🎬 {title}\n\n{branding}"
+        
+        try:
+            bot_inst.edit_message_text("📤 Fayl Telegram-a yüklənir...", chat_id, wait_msg.message_id)
+        except Exception:
+            pass
                 
+        with open(filepath, 'rb') as video:
+            bot_inst.send_video(
+                chat_id, 
+                video, 
+                caption=caption
+            )
+            
+        try:
+            bot_inst.delete_message(chat_id, wait_msg.message_id)
+        except Exception:
+            pass
+                
+    except yt_dlp.utils.DownloadError as de:
+        err_msg = str(de)
+        if "File is larger than max-filesize" in err_msg or "too large" in err_msg:
+            bot_inst.edit_message_text("⚠️ Faylın ölçüsü 50 MB limitini aşdı.", chat_id, wait_msg.message_id)
+        else:
+            bot_inst.edit_message_text(f"❌ {platform} videosunu yükləyərkən xəta baş verdi. Linkin aktiv və açıq (public) olduğuna əmin olun.", chat_id, wait_msg.message_id)
     except Exception as e:
-        print(f"{platform} download error: {e}")
-        bot_inst.reply_to(message, f"❌ {platform} videosunu yükləyərkən xəta baş verdi. Linkin aktiv və açıq (public) olduğuna əmin olun.")
+        logger.error(f"{platform} download error: {e}")
+        try:
+            bot_inst.edit_message_text(f"❌ {platform} videosunu yükləyərkən xəta baş verdi.", chat_id, wait_msg.message_id)
+        except Exception:
+            pass
     finally:
-        clean_file(filepath)
+        if filepath:
+            clean_file(filepath)
+        # Cleanup fragments
+        for f in os.listdir(DOWNLOAD_DIR):
+            if f.startswith(unique_id):
+                clean_file(os.path.join(DOWNLOAD_DIR, f))
+                
+        with active_downloads_lock:
+            if user_id in active_user_downloads:
+                active_user_downloads[user_id] = max(0, active_user_downloads[user_id] - 1)
 
-# Dynamic Bot Handler Registration
+
+# Queue worker function
+def queue_worker():
+    logger.info(f"Queue worker thread {threading.current_thread().name} started.")
+    while True:
+        task = download_queue.get()
+        if task is None:
+            break
+        
+        bot_inst, message, wait_msg, platform, media_type = task
+        try:
+            if media_type == "audio":
+                process_youtube_mp3(bot_inst, message, wait_msg)
+            else:
+                process_instagram_tiktok_mp4(bot_inst, message, wait_msg, platform)
+        except Exception as e:
+            logger.error(f"Error executing queued task: {e}")
+        finally:
+            download_queue.task_done()
+
+# Setup handlers on a given telebot instance
 def setup_handlers(bot_inst):
     
     def check_user_and_log(message):
@@ -456,12 +621,13 @@ def setup_handlers(bot_inst):
         username = message.from_user.username
         first_name = message.from_user.first_name
         
-        # Log user in DB
         db_register_user(user_id, username, first_name)
         
-        # Check ban status
         if db_is_banned(user_id):
-            bot_inst.reply_to(message, "🚫 Siz botdan istifadə etmək üçün bloklanmısınız.")
+            try:
+                bot_inst.reply_to(message, "🚫 Siz botdan istifadə etmək üçün bloklanmısınız.")
+            except Exception:
+                pass
             return False
         return True
 
@@ -488,7 +654,7 @@ def setup_handlers(bot_inst):
                 elif media_type == 'video':
                     bot_inst.send_video(message.chat.id, media_id, caption=start_text, parse_mode='Markdown')
             except Exception as e:
-                print(f"Error sending welcome media: {e}")
+                logger.error(f"Error sending welcome media: {e}")
                 bot_inst.reply_to(message, start_text, parse_mode='Markdown')
         else:
             bot_inst.reply_to(message, start_text, parse_mode='Markdown')
@@ -533,7 +699,7 @@ def setup_handlers(bot_inst):
                     active_clones[token].stop_polling()
                     del active_clones[token]
                 except Exception as e:
-                    print(f"Error stopping clone bot: {e}")
+                    logger.error(f"Error stopping clone bot: {e}")
             bot_inst.send_message(chat_id, "✅ Klon bot uğurla silindi.")
             send_clones_menu(bot_inst, chat_id)
             
@@ -580,7 +746,6 @@ def setup_handlers(bot_inst):
         elif data == "admin_users_list":
             show_users_list(bot_inst, chat_id)
             
-
         elif data.startswith("admin_user_view_"):
             target_id = int(data.replace("admin_user_view_", ""))
             show_user_details(bot_inst, chat_id, target_id)
@@ -620,21 +785,42 @@ def setup_handlers(bot_inst):
         
         # Match YouTube Link
         if re.search(YOUTUBE_REGEX, text) or "youtube.com" in text or "youtu.be" in text:
-            wait_msg = bot_inst.reply_to(message, "🎵 YouTube videosu tapıldı. Səs faylı (MP3) yüklənir, zəhmət olmasa gözləyin...")
+            with active_downloads_lock:
+                count = active_user_downloads.get(user_id, 0)
+                if count >= 1:
+                    bot_inst.reply_to(message, "⚠️ Sizin artıq aktiv bir yükləmə sorğunuz var. Zəhmət olmasa onun tamamlanmasını gözləyin.")
+                    return
+                active_user_downloads[user_id] = count + 1
+            
+            wait_msg = bot_inst.reply_to(message, "⏳ Sorğu növbəyə əlavə olundu...")
             db_log_download(user_id, text, "YouTube")
-            download_youtube_mp3(bot_inst, message, wait_msg)
+            download_queue.put((bot_inst, message, wait_msg, "YouTube", "audio"))
             
         # Match Instagram Link
         elif re.search(INSTAGRAM_REGEX, text) or "instagram.com" in text:
-            wait_msg = bot_inst.reply_to(message, "🎬 Instagram videosu tapıldı. Video (MP4) yüklənir, zəhmət olmasa gözləyin...")
+            with active_downloads_lock:
+                count = active_user_downloads.get(user_id, 0)
+                if count >= 1:
+                    bot_inst.reply_to(message, "⚠️ Sizin artıq aktiv bir yükləmə sorğunuz var. Zəhmət olmasa onun tamamlanmasını gözləyin.")
+                    return
+                active_user_downloads[user_id] = count + 1
+                
+            wait_msg = bot_inst.reply_to(message, "⏳ Sorğu növbəyə əlavə olundu...")
             db_log_download(user_id, text, "Instagram")
-            download_instagram_tiktok_mp4(bot_inst, message, wait_msg, "Instagram")
+            download_queue.put((bot_inst, message, wait_msg, "Instagram", "video"))
             
         # Match TikTok Link
         elif re.search(TIKTOK_REGEX, text) or "tiktok.com" in text:
-            wait_msg = bot_inst.reply_to(message, "🎬 TikTok videosu tapıldı. Video (MP4) yüklənir, zəhmət olmasa gözləyin...")
+            with active_downloads_lock:
+                count = active_user_downloads.get(user_id, 0)
+                if count >= 1:
+                    bot_inst.reply_to(message, "⚠️ Sizin artıq aktiv bir yükləmə sorğunuz var. Zəhmət olmasa onun tamamlanmasını gözləyin.")
+                    return
+                active_user_downloads[user_id] = count + 1
+                
+            wait_msg = bot_inst.reply_to(message, "⏳ Sorğu növbəyə əlavə olundu...")
             db_log_download(user_id, text, "TikTok")
-            download_instagram_tiktok_mp4(bot_inst, message, wait_msg, "TikTok")
+            download_queue.put((bot_inst, message, wait_msg, "TikTok", "video"))
 
 # Clone Bot Instances Runner
 def start_bot_instance(token):
@@ -655,32 +841,26 @@ def start_bot_instance(token):
         active_clones[token] = new_bot
         return True, me.username
     except Exception as e:
+        logger.error(f"Failed to start clone bot: {e}")
         return False, str(e)
 
 def load_clones():
     clones = db_get_all_clones()
-    print(f"Loading {len(clones)} clone bots...")
+    logger.info(f"Loading {len(clones)} clone bots from database...")
     for c in clones:
         success, res = start_bot_instance(c['token'])
         if success:
-            print(f"Clone bot @{res} started successfully.")
+            logger.info(f"Clone bot @{res} started successfully.")
         else:
-            print(f"Failed to start clone bot with token {c['token'][:10]}... Error: {res}")
+            logger.error(f"Failed to start clone bot with token {c['token'][:10]}... Error: {res}")
 
-if __name__ == "__main__":
-    # Initialize SQLite database tables
-    init_db()
-    
-    # Load all cloned bots from DB
-    load_clones()
-    
-    # Run the main bot
-    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or "8286423335:AAH1f5I4NM7B5nmJtEL7i-hCt5Umms7Aj_8"
-    main_bot = telebot.TeleBot(TOKEN)
-    setup_handlers(main_bot)
-    
-    print("Main bot is starting...")
-    try:
-        main_bot.infinity_polling(timeout=10, long_polling_timeout=5)
-    except Exception as e:
-        print(f"Main bot execution error: {e}")
+def start_queue_workers(num_workers=3):
+    """Starts the download queue background workers."""
+    for i in range(num_workers):
+        t = threading.Thread(
+            target=queue_worker, 
+            name=f"DownloadWorker-{i+1}", 
+            daemon=True
+        )
+        t.start()
+    logger.info(f"Started {num_workers} background download workers.")

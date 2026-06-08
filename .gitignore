@@ -3,3 +3,4 @@ bot_database.db
 downloads/
 __pycache__/
 *.pyc
+bot.log
