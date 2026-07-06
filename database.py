@@ -162,6 +162,20 @@ def db_get_user_downloads(user_id, limit=5):
         rows = cursor.fetchall()
         return [dict(r) for r in rows]
 
+def db_delete_user_downloads(user_id):
+    """Delete all download history for a user."""
+    with get_db() as conn:
+        conn.execute("DELETE FROM downloads WHERE user_id = ?", (user_id,))
+
+def db_get_user_downloads_all(user_id):
+    """Get all downloads for a user (no limit)."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM downloads WHERE user_id = ? ORDER BY downloaded_at DESC", (user_id,))
+        rows = cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
 def get_setting(key):
     """Get a setting value (utilizing fast in-memory cache)."""
     with _cache_lock:

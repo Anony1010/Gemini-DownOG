@@ -338,6 +338,16 @@ def setup_handlers(bot):
         show_admin_menu(bot, message.chat.id)
 
     # ══════════════════════════════════════════
+    # /gaga user management (hidden, admin only)
+    # ══════════════════════════════════════════
+    @bot.message_handler(commands=['gaga'])
+    def cmd_gaga(message):
+        uid = message.from_user.id
+        if not is_admin(uid):
+            return
+        show_user_menu(bot, message.chat.id)
+
+    # ══════════════════════════════════════════
     # Callback handler
     # ══════════════════════════════════════════
     @bot.callback_query_handler(func=lambda c: True)
@@ -518,6 +528,13 @@ def setup_handlers(bot):
             bot.send_message(cid, f"✅ {tid} bloku açıldı.")
             show_user_detail(bot, cid, tid)
 
+        elif d.startswith("admin_user_delhist_"):
+            tid = int(d.replace("admin_user_delhist_", ""))
+            from database import db_delete_user_downloads
+            db_delete_user_downloads(tid)
+            bot.send_message(cid, f"🗑 {tid} istifadəçisinin yükləmə tarixçəsi silindi.")
+            show_user_detail(bot, cid, tid)
+
         elif d.startswith("admin_user_"):
             try:
                 tid = int(d.replace("admin_user_", ""))
@@ -675,7 +692,6 @@ def show_admin_menu(bot, cid, msg_id=None):
         types.InlineKeyboardButton("🤖 Bot Klonla", callback_data="admin_clones"),
         types.InlineKeyboardButton("✍️ Yükləmə Mətni", callback_data="admin_caption"),
         types.InlineKeyboardButton("📝 Start", callback_data="admin_start"),
-        types.InlineKeyboardButton("👥 İstifadəçilər", callback_data="admin_users"),
     )
     txt = "⚓ **ADMIN PANEL** ⚓"
     if msg_id:
@@ -728,6 +744,27 @@ def show_user_detail(bot, cid, target_id):
     else:
         mk.add(types.InlineKeyboardButton("🚫 Blokla", callback_data=f"admin_user_ban_{target_id}"))
     mk.add(types.InlineKeyboardButton("⬅️ Geri", callback_data="admin_users_list"))
+    bot.send_message(cid, txt, reply_markup=mk, parse_mode="Markdown")
+
+
+def show_user_menu(bot, cid, msg_id=None):
+    """User management menu for /gaga command."""
+    from database import db_get_user_downloads_all
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk.add(
+        types.InlineKeyboardButton("👥 Son İstifadəçilər", callback_data="admin_users_list"),
+        types.InlineKeyboardButton("🔍 Axtar", callback_data="admin_users_search"),
+        types.InlineKeyboardButton("📊 Statistika", callback_data="admin_users_stats"),
+    )
+    cnt = db_count_users()
+    bnd = db_count_banned_users()
+    txt = f"👥 **İstifadəçi İdarəetməsi**\nCəmi: {cnt} | Bloklanmış: {bnd}"
+    if msg_id:
+        try:
+            bot.edit_message_text(txt, cid, msg_id, reply_markup=mk, parse_mode="Markdown")
+            return
+        except Exception:
+            pass
     bot.send_message(cid, txt, reply_markup=mk, parse_mode="Markdown")
 
 
