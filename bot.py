@@ -189,7 +189,7 @@ def start_yt_worker(bot, chat_id, user_id, url, fmt, wait_msg):
             finish_download(user_id)
             return
 
-        brand = get_setting("caption_branding") or "⚓ BY ORUJOV ⚓"
+        brand = get_setting("caption_branding") or "🔹 DOWNLOADED BY GASHAM🔹"
         safe_edit(bot, chat_id, wait_msg.message_id, "📤 Telegram-a yüklənir...")
 
         if fmt == "mp3":
@@ -249,16 +249,18 @@ def start_social_worker(bot, chat_id, user_id, url, platform, wait_msg):
         meta = probe_video(fp)
         thumb = generate_thumbnail(fp)
         sent = False
+        brand = get_setting("caption_branding") or "🔹 DOWNLOADED BY GASHAM🔹"
         try:
             with open(fp, "rb") as f:
                 bot.send_video(chat_id, f, supports_streaming=True,
                                width=meta.get("width"), height=meta.get("height"),
-                               duration=meta.get("duration"))
+                               duration=meta.get("duration"),
+                               caption=f"🔹 {brand}")
             sent = True
         except Exception:
             try:
                 with open(fp, "rb") as f:
-                    bot.send_document(chat_id, f)
+                    bot.send_document(chat_id, f, caption=f"🔹 {brand}")
                 sent = True
             except Exception:
                 pass
@@ -408,7 +410,7 @@ def setup_handlers(bot):
             show_clones_menu(bot, cid)
 
         elif d == "admin_caption":
-            cur = get_setting("caption_branding") or "⚓ BY ORUJOV ⚓"
+            cur = get_setting("caption_branding") or "🔹 DOWNLOADED BY GASHAM🔹"
             mk = types.InlineKeyboardMarkup(row_width=2)
             mk.add(
                 types.InlineKeyboardButton("✍️ Dəyiş", callback_data="admin_caption_set"),
@@ -477,18 +479,7 @@ def setup_handlers(bot):
             bot.send_message(cid, "✅ Start mediası silindi.")
 
         elif d == "admin_users":
-            mk = types.InlineKeyboardMarkup(row_width=2)
-            mk.add(
-                types.InlineKeyboardButton("👥 Son İstifadəçilər", callback_data="admin_users_list"),
-                types.InlineKeyboardButton("🔍 Axtar", callback_data="admin_users_search"),
-                types.InlineKeyboardButton("📊 Statistika", callback_data="admin_users_stats"),
-                types.InlineKeyboardButton("⬅️ Geri", callback_data="admin_menu"),
-            )
-            txt = f"👥 **İstifadəçilər**\nCəmi: {db_count_users()}"
-            try:
-                bot.edit_message_text(txt, cid, call.message.message_id, reply_markup=mk, parse_mode="Markdown")
-            except Exception:
-                bot.send_message(cid, txt, reply_markup=mk, parse_mode="Markdown")
+            show_user_menu(bot, cid, call.message.message_id)
 
         elif d == "admin_users_list":
             users = db_get_recent_users(15)
@@ -748,17 +739,24 @@ def show_user_detail(bot, cid, target_id):
 
 
 def show_user_menu(bot, cid, msg_id=None):
-    """User management menu for /gaga command."""
+    """User list for /gaga command - users with download history."""
     from database import db_get_user_downloads_all
-    mk = types.InlineKeyboardMarkup(row_width=2)
-    mk.add(
-        types.InlineKeyboardButton("👥 Son İstifadəçilər", callback_data="admin_users_list"),
-        types.InlineKeyboardButton("🔍 Axtar", callback_data="admin_users_search"),
-        types.InlineKeyboardButton("📊 Statistika", callback_data="admin_users_stats"),
-    )
+    users = db_get_recent_users(20)
+    if not users:
+        bot.send_message(cid, "❌ Hələ heç bir istifadəçi yoxdur.")
+        return
+    mk = types.InlineKeyboardMarkup(row_width=1)
+    for u in users:
+        nm = u.get("first_name", "?")[:18]
+        un = f"@{u['username']}" if u.get("username") else ""
+        st = "🔇" if u.get("is_banned") else "✅"
+        dl = db_get_user_downloads(u["user_id"], 1)
+        has_dl = "📥" if dl else ""
+        mk.add(types.InlineKeyboardButton(f"{st} {nm} {un} {has_dl}",
+                callback_data=f"admin_user_{u['user_id']}"))
     cnt = db_count_users()
     bnd = db_count_banned_users()
-    txt = f"👥 **İstifadəçi İdarəetməsi**\nCəmi: {cnt} | Bloklanmış: {bnd}"
+    txt = f"👥 **İstifadəçilər ({cnt})** | Blok: {bnd}\n\nİstifadəçi seçin:"
     if msg_id:
         try:
             bot.edit_message_text(txt, cid, msg_id, reply_markup=mk, parse_mode="Markdown")
