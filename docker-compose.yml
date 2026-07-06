@@ -1,0 +1,17 @@
+version: '3.8'
+services:
+  bot:
+    build: .
+    container_name: gemini-downog
+    restart: always
+    ports:
+      - "8080:8080"
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - ADMIN_ID=${ADMIN_ID}
+      - PORT=8080
+    volumes:
+      - bot_data:/app/downloads
+
+volumes:
+  bot_data:
