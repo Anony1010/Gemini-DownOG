@@ -846,4 +846,4 @@ def index():
     </body>
     </html>
     """
-    return HTMLResponse(content=html_content)
+    return Response(html_content, mimetype="text/html")

@@ -98,7 +98,7 @@ def clean_file(path):
         pass
 
 
-def register_user(message):
+def register_user(message, bot=None):
     """Register or update user in DB."""
     uid = message.from_user.id
     username = message.from_user.username or ""
@@ -106,8 +106,8 @@ def register_user(message):
     db_register_user(uid, username, fname)
     if db_is_banned(uid):
         try:
-            bot_instance = message.bot
-            bot_instance.reply_to(message, "🚫 Siz bloklanmısınız.")
+            if bot:
+                bot.reply_to(message, "🚫 Siz bloklanmısınız.")
         except Exception:
             pass
         return False
@@ -302,7 +302,7 @@ def setup_handlers(bot):
     # ══════════════════════════════════════════
     @bot.message_handler(commands=['start', 'help'])
     def cmd_start(message):
-        if not register_user(message):
+        if not register_user(message, bot):
             return
         cid = message.chat.id
         text = get_setting("start_message") or (
@@ -530,7 +530,7 @@ def setup_handlers(bot):
     # ══════════════════════════════════════════
     @bot.message_handler(func=lambda m: True, content_types=['text', 'photo', 'video'])
     def handle_msg(message):
-        if not register_user(message):
+        if not register_user(message, bot):
             return
         cid = message.chat.id
         uid = message.from_user.id
