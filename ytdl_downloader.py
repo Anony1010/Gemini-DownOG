@@ -126,12 +126,29 @@ def download_youtube(url: str, fmt: str = "mp4", unique_id: str = "") -> Optiona
     fmt: 'mp4' for video or 'mp3' for audio.
     Returns file path or None.
     """
-    outtmpl = os.path.join(DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
+    import yt_dlp
+
+    # First get the video title
+    try:
+        with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True, 'nocheckcertificate': True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            title = info.get('title', 'video') or 'video'
+            # Sanitize title for filename
+            title = re.sub(r'[\\/*?:"<>|]', '', title)[:80].strip()
+    except Exception:
+        title = f"video_{unique_id}" if unique_id else "video"
+
+    if not title:
+        title = f"video_{unique_id}" if unique_id else "video"
+
+    # Use title as filename
+    filename = f"{title}.%(ext)s" if fmt == "mp4" else f"{title}.mp3"
+    outtmpl = os.path.join(DOWNLOAD_DIR, filename)
 
     if fmt == "mp3":
         opts = {
             'format': 'bestaudio/best',
-            'outtmpl': outtmpl,
+            'outtmpl': os.path.join(DOWNLOAD_DIR, f"{title}.%(ext)s"),
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
@@ -145,7 +162,7 @@ def download_youtube(url: str, fmt: str = "mp4", unique_id: str = "") -> Optiona
     else:
         opts = {
             'format': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]',
-            'outtmpl': outtmpl,
+            'outtmpl': os.path.join(DOWNLOAD_DIR, f"{title}.%(ext)s"),
             'merge_output_format': 'mp4',
             'max_filesize': MAX_FILE_SIZE_BYTES,
             'quiet': True,
@@ -154,13 +171,12 @@ def download_youtube(url: str, fmt: str = "mp4", unique_id: str = "") -> Optiona
         }
 
     try:
-        import yt_dlp
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
 
         # Find the downloaded file
         for f in os.listdir(DOWNLOAD_DIR):
-            if f.startswith(unique_id):
+            if f.startswith(title) or f.startswith(f"{title}."):
                 fp = os.path.join(DOWNLOAD_DIR, f)
                 if os.path.getsize(fp) > 0:
                     return fp
@@ -175,11 +191,23 @@ def download_social_media(url: str, platform: str, unique_id: str = "") -> Optio
     Download from Instagram, TikTok, Facebook, Twitter etc using yt-dlp.
     Returns file path or None.
     """
-    outtmpl = os.path.join(DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
+    import yt_dlp
+
+    # First get the media title
+    try:
+        with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True, 'nocheckcertificate': True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            title = info.get('title', platform) or platform
+            title = re.sub(r'[\\/*?:"<>|]', '', title)[:80].strip()
+    except Exception:
+        title = f"{platform}_{unique_id}" if unique_id else platform
+
+    if not title:
+        title = f"{platform}_{unique_id}" if unique_id else platform
 
     opts = {
         'format': 'bestvideo+bestaudio/best',
-        'outtmpl': outtmpl,
+        'outtmpl': os.path.join(DOWNLOAD_DIR, f"{title}.%(ext)s"),
         'merge_output_format': 'mp4',
         'max_filesize': MAX_FILE_SIZE_BYTES,
         'quiet': True,
@@ -192,21 +220,14 @@ def download_social_media(url: str, platform: str, unique_id: str = "") -> Optio
         'ignoreerrors': False,
     }
 
-    # Platform-specific optimizations
-    if platform == "TikTok":
-        opts['extract_flat'] = False
-    elif platform == "Instagram":
-        opts['extract_flat'] = False
-
     try:
-        import yt_dlp
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
 
         for f in os.listdir(DOWNLOAD_DIR):
-            if f.startswith(unique_id):
+            if f.startswith(title):
                 fp = os.path.join(DOWNLOAD_DIR, f)
-                if os.path.getsize(fp) > 2048:  # > 2KB = valid
+                if os.path.getsize(fp) > 2048:
                     return fp
         return None
     except Exception as e:
