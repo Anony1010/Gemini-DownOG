@@ -38,13 +38,21 @@ def main():
     load_clones()
     logger.info("✅ Clone bots loaded")
 
-    # 4. Start polling in background
+    # 4. Start polling in background with auto-reconnect
+    import requests.exceptions
+
     def poll():
-        try:
-            logger.info("🚀 Telegram bot polling started...")
-            bot.infinity_polling(timeout=15, long_polling_timeout=10)
-        except Exception as e:
-            logger.critical(f"💥 Bot polling crashed: {e}")
+        while True:
+            try:
+                logger.info("🚀 Telegram bot polling started...")
+                bot.infinity_polling(timeout=15, long_polling_timeout=10, skip_pending=True)
+                break
+            except (requests.exceptions.SSLError, requests.exceptions.ConnectionError, 
+                    requests.exceptions.Timeout, Exception) as e:
+                logger.warning(f"💥 Polling crashed ({type(e).__name__}), restarting in 5s...")
+                import time
+                time.sleep(5)
+                continue
 
     t = threading.Thread(target=poll, daemon=True, name="BotPoller")
     t.start()
