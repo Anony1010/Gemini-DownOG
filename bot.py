@@ -18,10 +18,10 @@ from database import (
     db_delete_clone
 )
 from shared import logger, active_clones
-from ytdl_downloader import (
+from downloader import (
     detect_platform, download_youtube, download_social_media,
     probe_video, generate_thumbnail, file_size_mb, cleanup_temp,
-    schedule_cleanup, DOWNLOAD_DIR, MAX_FILE_SIZE_BYTES
+    schedule_cleanup, download_media, get_available_qualities, DOWNLOAD_DIR, MAX_FILE_SIZE_BYTES
 )
 
 # ─── Admin state tracking ───
@@ -169,15 +169,16 @@ def finish_download(user_id):
 
 # ─── YouTube Download Handler ───
 
-def start_yt_worker(bot, chat_id, user_id, url, fmt, wait_msg):
-    """Background worker for YouTube downloads."""
+def start_yt_worker(bot, chat_id, user_id, url, quality="best", is_audio=False, wait_msg=None):
+    """Background worker for YouTube downloads with quality selection."""
     uid = f"yt_{user_id}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
     fp = None
+    label = quality.upper() if not is_audio else "MP3"
     try:
         safe_edit(bot, chat_id, wait_msg.message_id,
-                  "🎬 YouTube yüklənir..." if fmt == "mp4" else "🎵 YouTube audiosu yüklənir...")
+                  f"🎬 YouTube {label} yüklənir...")
 
-        fp = download_youtube(url, fmt, uid)
+        fp = download_youtube(url, fmt=("mp3" if is_audio else "mp4"), unique_id=uid)
         if not fp or not os.path.exists(fp):
             safe_edit(bot, chat_id, wait_msg.message_id, "❌ Fayl tapılmadı.")
             finish_download(user_id)
@@ -192,7 +193,7 @@ def start_yt_worker(bot, chat_id, user_id, url, fmt, wait_msg):
         brand = get_setting("caption_branding") or "🔹 DOWNLOADED BY GASHAM🔹"
         safe_edit(bot, chat_id, wait_msg.message_id, "📤 Telegram-a yüklənir...")
 
-        if fmt == "mp3":
+        if is_audio:
             with open(fp, "rb") as f:
                 bot.send_audio(chat_id, f, caption=f"🎵 {brand}")
         else:
@@ -358,10 +359,13 @@ def setup_handlers(bot):
         cid = call.message.chat.id
         d = call.data
 
-        # ── YouTube format selection (any user) ──
-        if d in ("yt_mp4", "yt_mp3"):
+        # ── YouTube format & quality selection (any user) ──
+        if d.startswith("yt_"):
             bot.answer_callback_query(call.id)
-            fmt = "mp4" if d == "yt_mp4" else "mp3"
+            quality = d.replace("yt_", "")
+            is_audio = quality == "mp3"
+            if is_audio:
+                quality = "audio"
             url = user_last_url.get(uid)
             if not url:
                 bot.send_message(cid, "❌ Link tapılmadı. YouTube linkini yenidən göndərin.")
@@ -371,8 +375,9 @@ def setup_handlers(bot):
                 return
             safe_delete(bot, cid, call.message.message_id)
             wm = bot.send_message(cid, "⏳ Sıraya əlavə olundu...")
-            db_log_download(uid, url, f"YouTube {fmt.upper()}")
-            enqueue_download(lambda: start_yt_worker(bot, cid, uid, url, fmt, wm))
+            label = quality.upper()
+            db_log_download(uid, url, f"YouTube {label}")
+            enqueue_download(lambda: start_yt_worker(bot, cid, uid, url, quality, is_audio, wm))
             return
 
         # ── Admin-only below ──
@@ -644,16 +649,18 @@ def setup_handlers(bot):
                               "Pinterest, Reddit, Vimeo")
             return
 
-        # ── YouTube: show format selection ──
+        # ── YouTube: show format & quality selection ──
         if platform == "YouTube":
             safe_reaction(bot, cid, message.message_id, "🎬")
             user_last_url[uid] = text
             mk = types.InlineKeyboardMarkup(row_width=2)
             mk.add(
-                types.InlineKeyboardButton("🎬 MP4 (Video)", callback_data="yt_mp4"),
-                types.InlineKeyboardButton("🎵 MP3 (Audio)", callback_data="yt_mp3"),
+                types.InlineKeyboardButton("🎬 1080p", callback_data="yt_1080p"),
+                types.InlineKeyboardButton("🎬 720p", callback_data="yt_720p"),
+                types.InlineKeyboardButton("🎬 480p", callback_data="yt_480p"),
+                types.InlineKeyboardButton("🎵 MP3", callback_data="yt_mp3"),
             )
-            bot.send_message(cid, "**YouTube formatını seçin:**", reply_markup=mk, parse_mode="Markdown")
+            bot.send_message(cid, "**YouTube keyfiyyətini seçin:**", reply_markup=mk, parse_mode="Markdown")
             return
 
         # ── Other platforms: direct download ──
