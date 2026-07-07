@@ -255,12 +255,12 @@ def start_social_worker(bot, chat_id, user_id, url, platform, wait_msg):
                 bot.send_video(chat_id, f, supports_streaming=True,
                                width=meta.get("width"), height=meta.get("height"),
                                duration=meta.get("duration"),
-                               caption=f"🔹 {brand}")
+                               caption=brand)
             sent = True
         except Exception:
             try:
                 with open(fp, "rb") as f:
-                    bot.send_document(chat_id, f, caption=f"🔹 {brand}")
+                    bot.send_document(chat_id, f, caption=brand)
                 sent = True
             except Exception:
                 pass
